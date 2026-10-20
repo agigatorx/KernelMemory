@@ -1,0 +1,62 @@
+;
+; winzrt.inf
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ManufacturerName%
+CatalogFile = winzrt.cat
+DriverVer   = 10/20/2026,1.0.0.0
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+winzrt.sys = 1,,
+
+;*****************************************
+; Install Section
+;*****************************************
+
+[Manufacturer]
+%ManufacturerName% = Standard,NT$ARCH$.10.0...16299 ; %13% support introduced in build 16299
+
+[Standard.NT$ARCH$.10.0...16299]
+%winzrt.DeviceDesc% = winzrt_Device, Root\winzrt ; TODO: edit hw-id
+
+[winzrt_Device.NT]
+CopyFiles = File_Copy
+
+[File_Copy]
+winzrt.sys
+
+;-------------- Service installation
+[winzrt_Device.NT.Services]
+AddService = winzrt,%SPSVCINST_ASSOCSERVICE%, winzrt_Service_Inst
+
+; -------------- winzrt driver install sections (KMDF)
+[winzrt_Service_Inst]
+DisplayName    = %winzrt.SVCDESC%
+ServiceType    = 1               ; SERVICE_KERNEL_DRIVER
+StartType      = 3               ; SERVICE_DEMAND_START
+ErrorControl   = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %13%\winzrt.sys
+
+[winzrt_Device.NT.Wdf]
+KmdfService = winzrt, winzrt_wdfsect
+
+[winzrt_wdfsect]
+KmdfLibraryVersion = $KMDFVERSION$
+
+[Strings]
+SPSVCINST_ASSOCSERVICE = 0x00000002
+ManufacturerName = "winzrt"
+DiskName = "winzrt Installation Disk"
+winzrt.DeviceDesc = "winzrt Device"
+winzrt.SVCDESC = "winzrt Service"
