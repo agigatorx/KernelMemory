@@ -1,28 +1,37 @@
 /*
- * winzrt — kernel memory R/W driver (WDM, x64, Windows 10/11)
+ * winzrt — kernel memory R/W driver (KMDF, data pointer hook mekanizmasi)
+ *
+ * Mekanizma: driver icinde bir MEM_OBJECT'e bakan data pointer slotu
+ * (g_HookSlot) tutulur. Okuma/yazma IOCTL'lari slotu atomik olarak hedef
+ * adrese cevirir (InterlockedExchangePointer) ve erisimi slotun Buffer
+ * alanina yapar — yani R/W, hook'lanan veri isaretcisinden akar.
+ * Slot her islemden sonra park nesnesine geri alinir; detach sonrasi
+ * asla user adres tutmaz.
  *
  * IOCTL protokolu (METHOD_BUFFERED):
  *   IOCTL_WINZRT_READ    in: WINZRT_RW            out: ham veri (Size bayt)
  *   IOCTL_WINZRT_WRITE   in: WINZRT_RW + veri     out: -
  *   IOCTL_WINZRT_MODULE  in: WINZRT_MODULE_REQ    out: WINZRT_MODULE_RESP
- *
- * Okuma/yazma MmCopyVirtualMemory ile yapilir — hedef surece stack attach
- * edilmez, I/O manager'in kopya yolu kullanilir (yavas ama guvenli).
- * Modul tabani PEB Ldr listesi attach + __try ile gezilir.
  */
-#include <ntddk.h>
+#include <ntifs.h>     // ntddk ustunde dosya/surec API'leri — KMDF wdf.h ile uyumlu
+#include <wdf.h>
+
+// admin + SYSTEM disinda kimse acamaz — stringi kendimiz tasiyoruz,
+// Wdmsec.lib bagimliligi yok
+DECLARE_CONST_UNICODE_STRING(g_Sddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
 
 #define DEVICE_NAME   L"\\Device\\winzrt"
 #define SYMLINK_NAME  L"\\DosDevices\\winzrt"
 
 #define WINZRT_MAX_COPY    (1u * 1024u * 1024u)   // tek islemde tavan: 1 MB
 #define WINZRT_MAX_MODULES 512u                   // Ldr listesi siniri
+#define WINZRT_MIN_ADDR    0x1000ULL              // sayfa altindaki adres yok
 
 #define IOCTL_WINZRT_READ   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_WINZRT_WRITE  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_WINZRT_MODULE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
-/* usermode ile birebir ayni olmali — pack 8, 24+24+4+4 */
+/* usermode ile birebir ayni olmali — pack 8, 24 bayt */
 typedef struct _WINZRT_RW {
     ULONG64 Pid;
     ULONG64 Address;
@@ -39,13 +48,28 @@ typedef struct _WINZRT_MODULE_RESP {
     ULONG64 Base;
 } WINZRT_MODULE_RESP;
 
+/*
+ * Hook'lanan nesne. Slot bu yapinin Buffer alanina denk gelecek adrese
+ * cevrilir: slot = address - FIELD_OFFSET(MEM_OBJECT, Buffer).
+ * Boylece Buffer[0] hedef adresin ilk bayti olur.
+ */
+#define MEM_SHADOW      0x40
+#define MEM_OBJECT_MAGIC 0x5A52545757524E4BULL   // "KNWRTRZa"
+
+typedef struct _MEM_OBJECT {
+    ULONG64 Magic;                  /* +0x00 sabit imza — park nesnesi dogrulamasi */
+    ULONG64 Base;                   /* +0x08 retarget edilen adres */
+    ULONG64 Size;                   /* +0x10 pencere */
+    UCHAR   Buffer[MEM_SHADOW];     /* +0x18 erisim cipleri — R/W bu alana iner */
+} MEM_OBJECT;
+
 /* PEB / LDR — x64 layout, Ldr 0x18, InMemoryOrderLinks 0x10, DllBase 0x30 */
 typedef struct _PEB_LDR_DATA_I {
-    ULONG      Length;
-    BOOLEAN    Initialized;
-    PVOID      SsHandle;
-    LIST_ENTRY InLoadOrderModuleList;
-    LIST_ENTRY InMemoryOrderModuleList;
+    ULONG       Length;
+    BOOLEAN     Initialized;
+    PVOID       SsHandle;
+    LIST_ENTRY  InLoadOrderModuleList;
+    LIST_ENTRY  InMemoryOrderModuleList;
 } PEB_LDR_DATA_I, *PPEB_LDR_DATA_I;
 
 typedef struct _PEB_I {
@@ -57,32 +81,28 @@ typedef struct _PEB_I {
 } PEB_I, *PPEB_I;
 
 typedef struct _LDR_ENTRY_I {
-    LIST_ENTRY    InLoadOrderLinks;         /* +0x00 */
-    LIST_ENTRY    InMemoryOrderLinks;       /* +0x10 */
-    LIST_ENTRY    InInitializationOrderLinks;
-    PVOID         DllBase;                  /* +0x30 */
-    PVOID         EntryPoint;
-    ULONG         SizeOfImage;
+    LIST_ENTRY     InLoadOrderLinks;        /* +0x00 */
+    LIST_ENTRY     InMemoryOrderLinks;      /* +0x10 */
+    LIST_ENTRY     InInitializationOrderLinks;
+    PVOID          DllBase;                 /* +0x30 */
+    PVOID          EntryPoint;
+    ULONG          SizeOfImage;
     UNICODE_STRING FullDllName;
     UNICODE_STRING BaseDllName;
 } LDR_ENTRY_I, *PLDR_ENTRY_I;
 
-NTSYSAPI NTSTATUS NTAPI MmCopyVirtualMemory(
-    PEPROCESS SourceProcess,
-    PVOID     SourceAddress,
-    PEPROCESS TargetProcess,
-    PVOID     TargetAddress,
-    SIZE_T    BufferSize,
-    KPROCESSOR_MODE PreviousMode,
-    PSIZE_T   ReturnSize);
-
 NTKERNELAPI PVOID PsGetProcessPeb(PEPROCESS Process);
+
+/* --- hook'lanan data pointer slotu ------------------------------------- */
+
+static PVOID volatile g_HookSlot;        // tek entry point — sadece burasi cevrilir
+static MEM_OBJECT     g_RestObject;      // park nesnesi — slot burada dinlenir
 
 /* --- dogrulama: fail closed ------------------------------------------- */
 
 static NTSTATUS ValidateRw(const WINZRT_RW* req, ULONG64 limit)
 {
-    if (req->Pid == 0 || req->Address == 0)
+    if (req->Pid == 0 || req->Address < WINZRT_MIN_ADDR)
         return STATUS_INVALID_PARAMETER;
 
     /* non-canonical adres araligi (bit 63:47 sign-extend olmali) */
@@ -97,6 +117,41 @@ static NTSTATUS ValidateRw(const WINZRT_RW* req, ULONG64 limit)
         return STATUS_BUFFER_TOO_SMALL;
 
     return STATUS_SUCCESS;
+}
+
+/* --- hook'u kullanarak okuma/yazma ------------------------------------- */
+
+static NTSTATUS HookedCopy(
+    PEPROCESS target,
+    ULONG64  address,
+    PVOID    buffer,        // read: cikti, write: kaynak (ikisi de kernel tampon)
+    SIZE_T   size,
+    BOOLEAN  write)
+{
+    KAPC_STATE apc;
+    NTSTATUS status = STATUS_SUCCESS;
+    PVOID slotTarget = (PVOID)(ULONG_PTR)(address - FIELD_OFFSET(MEM_OBJECT, Buffer));
+
+    KeStackAttachProcess(target, &apc);
+
+    __try {
+        /* data pointer hook: slotu hedef adrese cevir */
+        InterlockedExchangePointer(&g_HookSlot, slotTarget);
+
+        /* erisim slotun uzerinden — Buffer[0] hedef adresin ilk bayti */
+        if (write)
+            RtlCopyMemory(((MEM_OBJECT*)g_HookSlot)->Buffer, buffer, size);
+        else
+            RtlCopyMemory(buffer, ((MEM_OBJECT*)g_HookSlot)->Buffer, size);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = GetExceptionCode();        // sayfa hatasi yutulur, surucu yasar
+    }
+
+    /* slotu park nesnesine geri al — detach sonrasi user adres kalmasin */
+    InterlockedExchangePointer(&g_HookSlot, &g_RestObject);
+
+    KeUnstackDetachProcess(&apc);
+    return status;
 }
 
 /* --- modul tabani: attach + PEB Ldr tarama ---------------------------- */
@@ -152,34 +207,46 @@ static NTSTATUS GetModuleBase(ULONG64 pid, const WCHAR* name, ULONG64* outBase)
     return (*outBase != 0) ? STATUS_SUCCESS : STATUS_NOT_FOUND;
 }
 
-/* --- IOCTL handler ----------------------------------------------------- */
+/* --- KMDF IOCTL handler ------------------------------------------------ */
 
-static NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+static VOID EvtIoDeviceControl(
+    WDFQUEUE   Queue,
+    WDFREQUEST Request,
+    size_t     OutputBufferLength,
+    size_t     InputBufferLength,
+    ULONG      IoControlCode)
 {
-    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(Irp);
-    const ULONG code  = stack->Parameters.DeviceIoControl.IoControlCode;
-    const ULONG inLen = stack->Parameters.DeviceIoControl.InputBufferLength;
-    const ULONG outLen = stack->Parameters.DeviceIoControl.OutputBufferLength;
-    PVOID buf = Irp->AssociatedIrp.SystemBuffer;
     NTSTATUS status = STATUS_INVALID_DEVICE_REQUEST;
     ULONG_PTR info = 0;
+    PVOID inBuf = NULL;
+    size_t inSize = 0;
 
-    UNREFERENCED_PARAMETER(DeviceObject);
+    UNREFERENCED_PARAMETER(Queue);
+    UNREFERENCED_PARAMETER(OutputBufferLength);
+    UNREFERENCED_PARAMETER(InputBufferLength);
 
-    switch (code) {
+    switch (IoControlCode) {
 
     case IOCTL_WINZRT_READ: {
         WINZRT_RW req;
+        PVOID outBuf = NULL;
+        size_t outSize = 0;
         PEPROCESS proc = NULL;
-        SIZE_T copied = 0;
 
-        if (buf == NULL || inLen < sizeof(WINZRT_RW)) {
-            status = STATUS_BUFFER_TOO_SMALL;
+        status = WdfRequestRetrieveInputBuffer(
+            Request, sizeof(WINZRT_RW), &inBuf, &inSize);
+        if (!NT_SUCCESS(status))
             break;
-        }
-        RtlCopyMemory(&req, buf, sizeof(req));   // header'i once al, cunku SystemBuffer'in uzerine veri yazilacak
 
-        status = ValidateRw(&req, outLen);
+        RtlCopyMemory(&req, inBuf, sizeof(req));   // header'i once al, cunku buffer uzerine veri yazilacak
+
+        // cikti tamponu en az req.Size kadar olmali — kucukse WDF zaten BUFFER_TOO_SMALL doner
+        status = WdfRequestRetrieveOutputBuffer(
+            Request, (SIZE_T)req.Size, &outBuf, &outSize);
+        if (!NT_SUCCESS(status))
+            break;
+
+        status = ValidateRw(&req, (ULONG64)outSize);
         if (!NT_SUCCESS(status))
             break;
 
@@ -187,37 +254,35 @@ static NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         if (!NT_SUCCESS(status))
             break;
 
-        status = MmCopyVirtualMemory(
-            proc,            (PVOID)(ULONG_PTR)req.Address,
-            PsGetCurrentProcess(), buf,
-            (SIZE_T)req.Size, KernelMode, &copied);
+        status = HookedCopy(proc, req.Address, outBuf, (SIZE_T)req.Size, FALSE);
 
         ObDereferenceObject(proc);
-
-        if (NT_SUCCESS(status) && copied != (SIZE_T)req.Size)
-            status = STATUS_PARTIAL_COPY;
-
-        info = (ULONG_PTR)copied;
         break;
     }
 
     case IOCTL_WINZRT_WRITE: {
         WINZRT_RW req;
         PEPROCESS proc = NULL;
-        SIZE_T copied = 0;
 
-        if (buf == NULL || inLen < sizeof(WINZRT_RW)) {
-            status = STATUS_BUFFER_TOO_SMALL;
+        status = WdfRequestRetrieveInputBuffer(
+            Request, sizeof(WINZRT_RW), &inBuf, &inSize);
+        if (!NT_SUCCESS(status))
+            break;
+
+        RtlCopyMemory(&req, inBuf, sizeof(req));
+
+        if (req.Size > WINZRT_MAX_COPY) {          // ikinci retrieve oncesi tavan kontrolu
+            status = STATUS_INVALID_BUFFER_SIZE;
             break;
         }
-        RtlCopyMemory(&req, buf, sizeof(req));
 
-        if (inLen < sizeof(WINZRT_RW) + (SIZE_T)req.Size) {
-            status = STATUS_BUFFER_TOO_SMALL;
+        // header + veri birlikte gelmeli
+        status = WdfRequestRetrieveInputBuffer(
+            Request, sizeof(WINZRT_RW) + (SIZE_T)req.Size, &inBuf, &inSize);
+        if (!NT_SUCCESS(status))
             break;
-        }
 
-        status = ValidateRw(&req, inLen - sizeof(WINZRT_RW));
+        status = ValidateRw(&req, inSize - sizeof(WINZRT_RW));
         if (!NT_SUCCESS(status))
             break;
 
@@ -225,30 +290,32 @@ static NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         if (!NT_SUCCESS(status))
             break;
 
-        status = MmCopyVirtualMemory(
-            PsGetCurrentProcess(), (UCHAR*)buf + sizeof(WINZRT_RW),
-            proc, (PVOID)(ULONG_PTR)req.Address,
-            (SIZE_T)req.Size, KernelMode, &copied);
+        status = HookedCopy(proc, req.Address,
+                            (UCHAR*)inBuf + sizeof(WINZRT_RW),
+                            (SIZE_T)req.Size, TRUE);
 
         ObDereferenceObject(proc);
-
-        if (NT_SUCCESS(status) && copied != (SIZE_T)req.Size)
-            status = STATUS_PARTIAL_COPY;
-
         break;
     }
 
     case IOCTL_WINZRT_MODULE: {
         WINZRT_MODULE_REQ req;
         WINZRT_MODULE_RESP resp = { 0 };
+        PVOID outBuf = NULL;
+        size_t outSize = 0;
         WCHAR name[260];
 
-        if (buf == NULL || inLen < sizeof(WINZRT_MODULE_REQ) ||
-            outLen < sizeof(WINZRT_MODULE_RESP)) {
-            status = STATUS_BUFFER_TOO_SMALL;
+        status = WdfRequestRetrieveInputBuffer(
+            Request, sizeof(WINZRT_MODULE_REQ), &inBuf, &inSize);
+        if (!NT_SUCCESS(status))
             break;
-        }
-        RtlCopyMemory(&req, buf, sizeof(req));
+
+        status = WdfRequestRetrieveOutputBuffer(
+            Request, sizeof(WINZRT_MODULE_RESP), &outBuf, &outSize);
+        if (!NT_SUCCESS(status))
+            break;
+
+        RtlCopyMemory(&req, inBuf, sizeof(req));
 
         if (req.Pid == 0) {
             status = STATUS_INVALID_PARAMETER;
@@ -256,89 +323,89 @@ static NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         }
 
         RtlCopyMemory(name, req.Name, sizeof(req.Name));
-        name[259] = L'\0';                      // her durumda sonlandir
+        name[259] = L'\0';                          // her durumda sonlandir
 
         status = GetModuleBase(req.Pid, name, &resp.Base);
         if (!NT_SUCCESS(status))
             break;
 
-        RtlCopyMemory(buf, &resp, sizeof(resp));
+        RtlCopyMemory(outBuf, &resp, sizeof(resp));
         info = sizeof(resp);
         break;
     }
 
     default:
-        status = STATUS_INVALID_DEVICE_REQUEST;
-        break;
+        break;                                      // status hala STATUS_INVALID_DEVICE_REQUEST
     }
 
-    Irp->IoStatus.Status = status;
-    Irp->IoStatus.Information = info;
-    IoCompleteRequest(Irp, IO_NO_INCREMENT);
-    return status;
+    WdfRequestCompleteWithInformation(Request, status, info);
 }
 
-static NTSTATUS DispatchCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
-{
-    UNREFERENCED_PARAMETER(DeviceObject);
-
-    Irp->IoStatus.Status = STATUS_SUCCESS;
-    Irp->IoStatus.Information = 0;
-    IoCompleteRequest(Irp, IO_NO_INCREMENT);
-    return STATUS_SUCCESS;
-}
-
-/* --- unload ------------------------------------------------------------ */
-
-static VOID DriverUnload(PDRIVER_OBJECT DriverObject)
-{
-    UNICODE_STRING symlink;
-
-    UNREFERENCED_PARAMETER(DriverObject);
-
-    RtlInitUnicodeString(&symlink, SYMLINK_NAME);
-    IoDeleteSymbolicLink(&symlink);
-
-    if (DriverObject->DeviceObject != NULL)
-        IoDeleteDevice(DriverObject->DeviceObject);
-
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "[winzrt] unloaded\n");
-}
-
-/* --- entry ------------------------------------------------------------- */
+/* --- entry: legacy (non-PnP) control driver --------------------------- */
 
 NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
 {
-    UNICODE_STRING devName, symlink;
-    PDEVICE_OBJECT deviceObject = NULL;
+    WDF_DRIVER_CONFIG config;
+    WDF_OBJECT_ATTRIBUTES attributes;
+    WDFDRIVER driver;
+    PWDFDEVICE_INIT deviceInit = NULL;
+    WDFDEVICE device;
+    WDF_IO_QUEUE_CONFIG queueConfig;
+    WDF_OBJECT_ATTRIBUTES deviceAttributes;
+    UNICODE_STRING deviceName, symlink;
     NTSTATUS status;
-    ULONG i;
 
-    UNREFERENCED_PARAMETER(RegistryPath);
+    /* park nesnesini hazirla, slotu uzerine birak */
+    RtlZeroMemory(&g_RestObject, sizeof(g_RestObject));
+    g_RestObject.Magic = MEM_OBJECT_MAGIC;
+    g_RestObject.Size  = MEM_SHADOW;
+    InterlockedExchangePointer(&g_HookSlot, &g_RestObject);
 
-    RtlInitUnicodeString(&devName, DEVICE_NAME);
-    RtlInitUnicodeString(&symlink, SYMLINK_NAME);
+    WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
 
-    status = IoCreateDevice(
-        DriverObject, 0, &devName,
-        FILE_DEVICE_UNKNOWN, FILE_DEVICE_SECURE_OPEN, FALSE, &deviceObject);
+    WDF_DRIVER_CONFIG_INIT(&config, WDF_NO_EVENT_CALLBACK);
+    config.DriverPoolTag = 'wzrW';
+
+    status = WdfDriverCreate(DriverObject, RegistryPath,
+                             &attributes, &config, &driver);
     if (!NT_SUCCESS(status))
         return status;
 
-    status = IoCreateSymbolicLink(&symlink, &devName);
+    deviceInit = WdfControlDeviceInitAllocate(driver, &g_Sddl);
+    if (deviceInit == NULL)
+        return STATUS_INSUFFICIENT_RESOURCES;
+
+    WdfDeviceInitSetExclusive(deviceInit, FALSE);
+
+    RtlInitUnicodeString(&deviceName, DEVICE_NAME);
+    status = WdfDeviceInitAssignName(deviceInit, &deviceName);
     if (!NT_SUCCESS(status)) {
-        IoDeleteDevice(deviceObject);
+        WdfDeviceInitFree(deviceInit);
         return status;
     }
 
-    for (i = 0; i <= IRP_MJ_MAXIMUM_FUNCTION; ++i)
-        DriverObject->MajorFunction[i] = DispatchCreateClose;
+    WDF_OBJECT_ATTRIBUTES_INIT(&deviceAttributes);
+    status = WdfDeviceCreate(&deviceInit, &deviceAttributes, &device);
+    if (!NT_SUCCESS(status)) {
+        WdfDeviceInitFree(deviceInit);
+        return status;
+    }
 
-    DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = DispatchDeviceControl;
-    DriverObject->DriverUnload = DriverUnload;
+    RtlInitUnicodeString(&symlink, SYMLINK_NAME);
+    status = WdfDeviceCreateSymbolicLink(device, &symlink);
+    if (!NT_SUCCESS(status))
+        return status;
 
-    deviceObject->Flags &= ~DO_DEVICE_INITIALIZING;
+    WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queueConfig, WdfIoQueueDispatchParallel);
+    queueConfig.EvtIoDeviceControl = EvtIoDeviceControl;
 
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "[winzrt] loaded\n");
+    status = WdfIoQueueCreate(device, &queueConfig,
+                              WDF_NO_OBJECT_ATTRIBUTES, WDF_NO_HANDLE);
+    if (!NT_SUCCESS(status))
+        return status;
+
+    WdfControlFinishInitializing(device);
+
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "[winzrt] loaded (kmdf, dp-hook)\n");
     return STATUS_SUCCESS;
 }
